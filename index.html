@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101827">
+<meta name="description" content="Live sound recognition and frequency analysis on your phone.">
+<link rel="manifest" href="manifest.webmanifest">
+<title>BioSound AI</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#151f31;--muted:#9eacc2;--accent:#64e0bd}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#0b1220,#14243a);color:#f4f7fb;font:16px system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+main{max-width:620px;margin:auto;padding:24px 18px 40px}.brand{display:flex;align-items:center;gap:12px;margin:12px 0 24px}.logo{width:48px;height:48px;border-radius:15px;background:#193c45;display:grid;place-items:center;font-size:25px}.sub{color:var(--muted);font-size:13px}
+h1{font-size:25px;margin:0}h2{font-size:16px;margin:0 0 14px}.panel{background:#151f31;border:1px solid #27354b;border-radius:20px;padding:18px;margin:14px 0;box-shadow:0 12px 30px #0002}
+.status{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:14px;margin-bottom:15px}.dot{width:9px;height:9px;border-radius:50%;background:#718096}.dot.live{background:#64e0bd;box-shadow:0 0 12px #64e0bd}
+button{width:100%;border:0;border-radius:15px;padding:16px;font-size:16px;font-weight:700;background:var(--accent);color:#08221d;margin-top:8px}button.secondary{background:#2a3950;color:#f4f7fb}button:disabled{opacity:.55}
+.sound{font-size:29px;font-weight:750;line-height:1.2;margin:7px 0}.score{color:var(--accent);font-weight:700}.muted{color:var(--muted)}.row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #2a374a}.row:last-child{border:0}.meter{height:8px;background:#2a374a;border-radius:9px;overflow:hidden;margin-top:10px}.meter span{display:block;height:100%;width:0;background:var(--accent)}
+canvas{width:100%;height:90px;background:#101827;border-radius:12px}.note{font-size:12px;color:var(--muted);line-height:1.5}.error{color:#ffb4a9;font-size:13px;white-space:pre-wrap}.tag{display:inline-block;padding:5px 9px;background:#23374a;border-radius:9px;color:#c7d7e9;font-size:12px;margin:4px 4px 0 0}
+</style>
+</head>
+<body>
+<main>
+ <div class="brand"><div class="logo">◉</div><div><h1>BioSound AI</h1><div class="sub">Live sound recognition · frequency analysis</div></div></div>
+ <section class="panel">
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Ready — allow microphone access to begin</span></div>
+  <div class="sub">CURRENT SOUND</div><div class="sound" id="sound">Waiting for sound…</div>
+  <div class="score" id="score">No prediction yet</div><div class="meter"><span id="confidence"></span></div>
+  <button id="start">Start listening</button><button id="stop" class="secondary" disabled>Stop listening</button>
+  <div id="error" class="error"></div>
+ </section>
+ <section class="panel">
+  <h2>Frequency analysis</h2>
+  <div class="row"><span class="muted">Dominant frequency</span><strong id="freq">— Hz</strong></div>
+  <div class="row"><span class="muted">Signal level (RMS)</span><strong id="rms">—</strong></div>
+  <div style="margin-top:13px"><canvas id="spectrum" width="560" height="150"></canvas></div>
+  <div class="note">The frequency chart is a live spectrum estimate. A dominant frequency alone does not identify a sound.</div>
+ </section>
+ <section class="panel">
+  <h2>Other possible sounds</h2><div id="others" class="muted">Predictions will appear here.</div>
+ </section>
+ <div class="note">AI model: Google YAMNet (general environmental audio categories). It can recognize broad classes such as vehicles, birds, speech and appliances, but may confuse similar sounds. Scores are model scores, not guaranteed probabilities. Audio is processed in this browser session; this app does not upload or save recordings.</div>
+</main>
+<script type="module">
+import {AudioClassifier, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio/audio_bundle.mjs";
+const MODEL_URL="https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/latest/yamnet.tflite";
+const $=id=>document.getElementById(id);
+let stream=null,ctx=null,source=null,processor=null,classifier=null,active=false,buffer=[],modelReady=false;
+const TARGET=16000, WINDOW=15600;
+function setStatus(s,live=false){$("status").textContent=s;$("dot").className=live?"dot live":"dot";}
+function rmsOf(a){let s=0;for(let x of a)s+=x*x;return Math.sqrt(s/a.length);}
+function resample(input,fromRate,toRate){
+ if(fromRate===toRate)return input;
+ const ratio=fromRate/toRate, len=Math.floor(input.length/ratio), out=new Float32Array(len);
+ for(let i=0;i<len;i++){const pos=i*ratio, left=Math.floor(pos), frac=pos-left;out[i]=(input[left]||0)*(1-frac)+(input[Math.min(left+1,input.length-1)]||0)*frac;}
+ return out;
+}
+function drawSpectrum(analyser){
+ const canvas=$("spectrum"),c=canvas.getContext("2d"),n=analyser.frequencyBinCount,data=new Uint8Array(n);
+ analyser.getByteFrequencyData(data);c.clearRect(0,0,canvas.width,canvas.height);c.fillStyle="#64e0bd";
+ const step=Math.max(1,Math.floor(n/100)),bar=canvas.width/Math.ceil(n/step);
+ for(let i=0,x=0;i<n;i+=step,x++){let v=data[i]/255*canvas.height;c.fillRect(x*bar,canvas.height-v,Math.max(1,bar-2),v);}
+ let peak=0;for(let i=1;i<n;i++)if(data[i]>data[peak])peak=i;
+ const hz=peak*ctx.sampleRate/2/n;$("freq").textContent=hz.toFixed(1)+" Hz";
+}
+async function setupModel(){
+ if(classifier)return;
+ setStatus("Loading sound AI model…");
+ const files=await FilesetResolver.forAudioTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio/wasm");
+ classifier=await AudioClassifier.createFromOptions(files,{baseOptions:{modelAssetPath:MODEL_URL},maxResults:5});
+}
+function showResults(results){
+ const first=results?.[0]?.classifications?.[0]?.categories||[];
+ if(!first.length)return;
+ const top=first[0], name=top.displayName||top.categoryName||"Unknown sound", pct=Math.round(top.score*100);
+ $("sound").textContent=name;$("score").textContent=`Model score: ${pct}%`;$("confidence").style.width=pct+"%";
+ $("others").innerHTML=first.slice(1,5).map(x=>`<span class="tag">${(x.displayName||x.categoryName)} · ${Math.round(x.score*100)}%</span>`).join("")||"No other strong matches.";
+}
+async function start(){
+ $("error").textContent="";$("start").disabled=true;
+ try{
+  await setupModel();
+  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  ctx=new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();
+  source=ctx.createMediaStreamSource(stream);
+  const analyser=ctx.createAnalyser();analyser.fftSize=2048;source.connect(analyser);
+  processor=ctx.createScriptProcessor(4096,1,1);
+  processor.onaudioprocess=e=>{
+   if(!active)return;
+   const input=e.inputBuffer.getChannelData(0);const copy=new Float32Array(input);
+   const mono=resample(copy,ctx.sampleRate,TARGET);
+   for(let v of mono)buffer.push(v);
+   const level=rmsOf(mono);$("rms").textContent=level.toFixed(4);
+   drawSpectrum(analyser);
+   while(buffer.length>=WINDOW){
+    const frame=new Float32Array(buffer.splice(0,WINDOW));
+    try{showResults(classifier.classify(frame,TARGET));}catch(err){console.warn(err);}
+   }
+  };
+  source.connect(processor);processor.connect(ctx.destination);
+  active=true;$("stop").disabled=false;setStatus("Listening — make a sound near your phone",true);
+ }catch(err){
+  $("error").textContent="Could not start: "+(err.message||err)+"\nOpen this app from a secure HTTPS website and allow microphone permission.";
+  setStatus("Microphone or model setup failed");$("start").disabled=false;
+ }
+}
+async function stop(){
+ active=false;if(processor){processor.disconnect();processor.onaudioprocess=null;processor=null;}
+ if(source)source.disconnect();if(stream)stream.getTracks().forEach(t=>t.stop());if(ctx)await ctx.close();
+ stream=null;ctx=null;source=null;buffer=[];$("start").disabled=false;$("stop").disabled=true;setStatus("Stopped");
+}
+$("start").addEventListener("click",start);$("stop").addEventListener("click",stop);
+if("serviceWorker" in navigator && location.protocol.startsWith("http"))navigator.serviceWorker.register("./sw.js").catch(()=>{});
+</script>
+</body></html>
